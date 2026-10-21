@@ -1,0 +1,9 @@
+Package: uuhelper
+Name: uu 远控增强
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: UU 远控常用组合键、圆环滚轮与显示器视角记忆增强。
+Maintainer: junhong
+Author: junhong
+Section: Tweaks
+Depends: firmware (>= 15.0)
