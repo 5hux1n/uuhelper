@@ -46,12 +46,12 @@ static CGFloat UUSettingsRowHeight(UITableView *table, UITableViewCell *cell) {
     return 56;
 }
 
-// Use UU's own labels, switch, constraints and colors; no host cell model is changed.
+// Keep each row in its native cell, including the link cell's own arrow and background.
 static UITableViewCell *UUSettingsCell(UITableView *table, NSString *title, NSString *key, id target) {
     NSString *identifier = key ?: @"uuhelper.link";
     UITableViewCell *cell = [table dequeueReusableCellWithIdentifier:identifier];
     if (!cell) {
-        Class cls = objc_getClass("_TtC14nrd_ios_client22MineSettingsSwitchCell");
+        Class cls = objc_getClass(key ? "_TtC14nrd_ios_client22MineSettingsSwitchCell" : "_TtC14nrd_ios_client24AccountInfoTableViewCell");
         cell = [[cls alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:identifier];
     }
     UILabel *label = UUSettingsIvar(cell, "$__lazy_storage_$_titleLabel");
@@ -62,33 +62,37 @@ static UITableViewCell *UUSettingsCell(UITableView *table, NSString *title, NSSt
     subtitle.text = nil;
     UUInvalidateNativeLabel(label);
     UUInvalidateNativeLabel(subtitle);
-    toggle.hidden = !key;
-    id switchLayout = UUYogaLayout(toggle);
-    SEL included = sel_registerName("setIncludedInLayout:");
-    if ([switchLayout respondsToSelector:included]) ((void (*)(id, SEL, BOOL))objc_msgSend)(switchLayout, included, key != nil);
-    [toggle removeTarget:nil action:NULL forControlEvents:UIControlEventValueChanged];
     if (key) {
+        [toggle removeTarget:nil action:NULL forControlEvents:UIControlEventValueChanged];
         toggle.accessibilityIdentifier = key;
         toggle.on = [UUPreferences() boolForKey:key];
         toggle.enabled = [key isEqualToString:@"enabled"] || [UUPreferences() boolForKey:@"enabled"];
         [toggle addTarget:target action:@selector(settingChanged:) forControlEvents:UIControlEventValueChanged];
     }
     cell.selectionStyle = key ? UITableViewCellSelectionStyleNone : UITableViewCellSelectionStyleDefault;
-    cell.accessoryType = key ? UITableViewCellAccessoryNone : UITableViewCellAccessoryDisclosureIndicator;
+    cell.accessoryType = UITableViewCellAccessoryNone;
     [cell setNeedsLayout];
     return cell;
 }
 
-@interface UUHelperSettingsController : UITableViewController
-@property (nonatomic, strong) UIColor *nativeBackground;
+static void UURoundSettingsCell(UITableViewCell *cell, BOOL first, BOOL last) {
+    CACornerMask corners = (first ? kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner : 0) |
+        (last ? kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner : 0);
+    UIView *surface = UUSettingsIvar(cell, "$__lazy_storage_$_containerView") ?: cell.contentView;
+    for (UIView *view in @[cell, surface]) {
+        view.layer.cornerRadius = corners ? 12 : 0;
+        view.layer.maskedCorners = corners;
+        view.layer.cornerCurve = kCACornerCurveContinuous;
+        view.layer.masksToBounds = YES;
+    }
+}
+
+@interface UUHelperSettingsController : NSObject <UITableViewDataSource, UITableViewDelegate>
+@property (nonatomic, weak) UITableView *tableView;
+@property (nonatomic, weak) UIViewController *hostController;
 - (void)settingChanged:(UISwitch *)sender;
 @end
 @implementation UUHelperSettingsController
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = @"uu 远控增强";
-    self.tableView.backgroundColor = self.nativeBackground;
-}
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)table { return 4; }
 - (NSInteger)tableView:(UITableView *)table numberOfRowsInSection:(NSInteger)section {
     return section == 0 ? 1 : section == 3 ? 4 : 2;
@@ -96,11 +100,7 @@ static UITableViewCell *UUSettingsCell(UITableView *table, NSString *title, NSSt
 - (NSString *)tableView:(UITableView *)table titleForHeaderInSection:(NSInteger)section {
     return @[@"", @"键盘与鼠标", @"画面与显示器", @"关于与支持"][section];
 }
-- (NSString *)tableView:(UITableView *)table titleForFooterInSection:(NSInteger)section {
-    if (section == 0) return @"关闭总开关会保留各项选择。首次使用时，所有功能默认关闭。";
-    if (section == 2) return @"快捷切屏将工具栏的“展开所有窗口”和“显示桌面”替换为显示器 1、2；缩放与位置记忆也适用于切回前台。";
-    return nil;
-}
+- (CGFloat)tableView:(UITableView *)table heightForFooterInSection:(NSInteger)section { return 0.01; }
 - (CGFloat)tableView:(UITableView *)table heightForRowAtIndexPath:(NSIndexPath *)path {
     return UUSettingsRowHeight(table, [self tableView:table cellForRowAtIndexPath:path]);
 }
@@ -108,11 +108,8 @@ static UITableViewCell *UUSettingsCell(UITableView *table, NSString *title, NSSt
     if (![view isKindOfClass:UITableViewHeaderFooterView.class]) return;
     UITableViewHeaderFooterView *header = (UITableViewHeaderFooterView *)view;
     UIView *background = [UIView new];
-    background.backgroundColor = self.nativeBackground;
+    background.backgroundColor = self.hostController.view.backgroundColor;
     header.backgroundView = background;
-}
-- (void)tableView:(UITableView *)table willDisplayFooterView:(UIView *)view forSection:(NSInteger)section {
-    [self tableView:table willDisplayHeaderView:view forSection:section];
 }
 - (UITableViewCell *)tableView:(UITableView *)table cellForRowAtIndexPath:(NSIndexPath *)path {
     NSArray *titles = @[@[@"启用 uu 远控增强"], @[@"常用快捷键", @"圆盘鼠标滚轮"],
@@ -120,6 +117,10 @@ static UITableViewCell *UUSettingsCell(UITableView *table, NSString *title, NSSt
     NSArray *keys = @[@[@"enabled"], @[@"shortcuts", @"wheel"], @[@"displaySwitch", @"viewportMemory"]];
     NSString *key = path.section < 3 ? keys[path.section][path.row] : nil;
     return UUSettingsCell(table, titles[path.section][path.row], key, self);
+}
+- (void)tableView:(UITableView *)table willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)path {
+    UURoundSettingsCell(cell, path.row == 0,
+        path.row == [self tableView:table numberOfRowsInSection:path.section] - 1);
 }
 - (void)settingChanged:(UISwitch *)sender {
     [UUPreferences() setBool:sender.on forKey:sender.accessibilityIdentifier];
@@ -136,7 +137,7 @@ static UITableViewCell *UUSettingsCell(UITableView *table, NSString *title, NSSt
         dispatch_async(dispatch_get_main_queue(), ^{
             UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"无法打开支付宝" message:@"请确认已安装支付宝。" preferredStyle:UIAlertControllerStyleAlert];
             [alert addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-            [self presentViewController:alert animated:YES completion:nil];
+            [self.hostController presentViewController:alert animated:YES completion:nil];
         });
     }];
 }
@@ -173,21 +174,26 @@ static void hook_settings_select(id self, SEL cmd, UITableView *table, NSIndexPa
     for (UIResponder *r = table; r; r = r.nextResponder) {
         if ([r isKindOfClass:UIViewController.class]) { parent = (UIViewController *)r; break; }
     }
-    UUHelperSettingsController *controller = [[UUHelperSettingsController alloc] initWithStyle:table.style];
-    controller.overrideUserInterfaceStyle = parent.view.traitCollection.userInterfaceStyle;
-    // The host table is transparent; its enclosing settings page supplies the visible background.
-    controller.nativeBackground = parent.view.backgroundColor;
-    Class tableClass = objc_getClass("_TtC14nrd_ios_client13BaseTableView");
-    UITableView *settingsTable = [[tableClass alloc] initWithFrame:CGRectZero style:table.style];
-    settingsTable.backgroundColor = controller.nativeBackground;
-    settingsTable.separatorStyle = table.separatorStyle;
-    settingsTable.separatorColor = table.separatorColor;
-    settingsTable.tintColor = table.tintColor;
-    controller.tableView = settingsTable;
+    // Let UU build its navigation, theme, insets and table before replacing only this page's rows.
+    Class pageClass = objc_getClass("_TtC14nrd_ios_client26MineSettingsViewController");
+    UIViewController *controller = [[pageClass alloc] initWithNibName:nil bundle:nil];
+    [controller loadViewIfNeeded];
+    UITableView *settingsTable = UUSettingsIvar(controller, "$__lazy_storage_$_tableView");
+    if (!settingsTable) return;
+    controller.title = @"uu 远控增强";
+    settingsTable.tableFooterView = nil;
+    UUHelperSettingsController *driver = [UUHelperSettingsController new];
+    driver.tableView = settingsTable;
+    driver.hostController = controller;
+    objc_setAssociatedObject(controller, @selector(settingChanged:), driver, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    settingsTable.dataSource = driver;
+    settingsTable.delegate = driver;
+    [settingsTable reloadData];
     [parent.navigationController pushViewController:controller animated:YES];
 }
 static void hook_settings_will_display(id self, SEL cmd, UITableView *table, id cell, NSIndexPath *path) {
-    if (!UUIsPluginSection(self, table, path.section)) ((void (*)(id, SEL, id, id, id))sSettingsWillDisplay)(self, cmd, table, cell, path);
+    if (UUIsPluginSection(self, table, path.section)) UURoundSettingsCell(cell, YES, YES);
+    else ((void (*)(id, SEL, id, id, id))sSettingsWillDisplay)(self, cmd, table, cell, path);
 }
 static void hook_settings_end_display(id self, SEL cmd, UITableView *table, id cell, NSIndexPath *path) {
     if (!UUIsPluginSection(self, table, path.section)) ((void (*)(id, SEL, id, id, id))sSettingsEndDisplay)(self, cmd, table, cell, path);
@@ -208,7 +214,9 @@ static CGFloat hook_settings_footer_height(id self, SEL cmd, UITableView *table,
 void UUInstallSettings(void) {
     static BOOL installed;
     Class cls = objc_getClass("_TtC14nrd_ios_client25MineSettingTableViewModel");
-    if (installed || !cls || !objc_getClass("_TtC14nrd_ios_client22MineSettingsSwitchCell")) return;
+    if (installed || !cls || !objc_getClass("_TtC14nrd_ios_client22MineSettingsSwitchCell") ||
+        !objc_getClass("_TtC14nrd_ios_client24AccountInfoTableViewCell") ||
+        !objc_getClass("_TtC14nrd_ios_client26MineSettingsViewController")) return;
     struct { const char *selector; IMP hook; IMP *original; } hooks[] = {
         {"numberOfSectionsInTableView:", (IMP)hook_settings_sections, &sSettingsSections},
         {"tableView:numberOfRowsInSection:", (IMP)hook_settings_rows, &sSettingsRows},
