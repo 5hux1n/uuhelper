@@ -5,17 +5,32 @@
 #import <mach-o/loader.h>
 #import <dlfcn.h>
 #import <math.h>
+#import "UUSettings.h"
 
+extern void uuss_call_swift_method(void *fn, void *swiftSelf, void *arg0);
 extern void uuss_call_key_sink(void *fn, void *sink, void *array, uint8_t action, void *type, void *wtable);
 extern void uuss_call_swift_geometry(void *fn, void *swiftSelf, double a, double b);
 
 #define UULog(fmt, ...) NSLog(@"[uuhelper] " fmt, ##__VA_ARGS__)
 
+static const uint8_t kItemTypeShowDesktop      = 4;
+static const uint8_t kItemTypeExpandAllWindows = 5;
+
+static const char *kClsToolBar   = "_TtC14nrd_ios_client13RemoteToolBar";
+static const char *kClsItem      = "_TtC14nrd_ios_clientP33_7245C1225B2709A2490E4B814BBC544E17RemoteToolBarItem";
 static const char *kClsViewModel  = "_TtC14nrd_ios_client21ControlPanelViewModel";
 static const char *kClsCombineKey = "_TtC14nrd_ios_client24CombineKeyViewController";
 static const char *kClsMouse      = "_TtC14nrd_ios_client9MouseView";
 static const char *kClsKeyButton  = "_TtC14nrd_ios_client18FullKeyboardButton";
 static const char *kClsMenuItem   = "_TtC14nrd_ios_client23MultiScreenMenuItemView";
+
+static char kAssocDisplayIndex;   // NSNumber: 0 / 1 / -1(不处理)
+static char kAssocActiveIndex;    // NSNumber: session 当前选中的屏幕索引兜底
+static char kAssocToolBarWatcher; // UUToolBarWatcher: 定时同步多屏菜单切换状态
+
+static char kAssocToolbarAppearance;
+static IMP sOrigLayout, sOrigDidClick;
+static void UUUpdateToolBar(UIView *toolBar);
 
 static char kAssocShortcutIndex;     // NSNumber: 新增组合键行的序号
 static char kAssocShortcutTemplate;  // UIView: 对应的原始符号键（只读取平台）
@@ -44,6 +59,7 @@ static IMP sOrigWheel           = NULL;
 static IMP sOrigMenuItemLayout  = NULL;
 static IMP sOrigContentLayout   = NULL;
 static IMP sOrigRenderTransform = NULL;
+static IMP sOrigAppSendEvent = NULL;
 
 // ---- Helpers -----------------------------------------------------------------
 
@@ -64,8 +80,17 @@ static intptr_t UUMainImageSlide(void) {
     return slide;
 }
 
+static NSInteger UUAppLayout(void) {
+    NSDictionary *info = NSBundle.mainBundle.infoDictionary;
+    NSString *version = info[@"CFBundleShortVersionString"];
+    NSString *build = info[@"CFBundleVersion"];
+    if ([version isEqualToString:@"4.42.0"] && [build isEqualToString:@"193"]) return 442;
+    if ([version isEqualToString:@"4.43.0"] && [build isEqualToString:@"195"]) return 443;
+    return 0;
+}
+
 static BOOL UUIsSupportedAppVersion(void) {
-    return YES;
+    return UUAppLayout() != 0;
 }
 
 static BOOL UUIsMainImagePointer(void *ptr) {
@@ -91,6 +116,30 @@ static void UUSwiftRelease(void *object) {
     if (release) release(object);
 }
 
+static Class UUItemClass(void) {
+    static Class cls = Nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cls = objc_getClass(kClsItem);
+        if (!cls) {
+            int numClasses = objc_getClassList(NULL, 0);
+            if (numClasses > 0) {
+                Class *classes = (__unsafe_unretained Class *)malloc(sizeof(Class) * numClasses);
+                numClasses = objc_getClassList(classes, numClasses);
+                for (int i = 0; i < numClasses; i++) {
+                    const char *name = class_getName(classes[i]);
+                    if (strstr(name, "RemoteToolBarItem") != NULL) {
+                        cls = classes[i];
+                        break;
+                    }
+                }
+                free(classes);
+            }
+        }
+    });
+    return cls;
+}
+
 static id UUObjectIvar(id obj, const char *name) {
     if (!obj) return nil;
     Ivar iv = class_getInstanceVariable(object_getClass(obj), name);
@@ -114,6 +163,44 @@ static UILabel *UUFirstLabel(UIView *v) {
         if (l) return l;
     }
     return nil;
+}
+
+static UIWindow *UUKeyWindow(void) {
+    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)scene).windows) {
+            if (w.isKeyWindow) return w;
+        }
+    }
+    return nil;
+}
+
+static void UUToast(NSString *text) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *win = UUKeyWindow();
+        if (!win) return;
+        UILabel *label = [[UILabel alloc] init];
+        label.text = text;
+        label.textColor = UIColor.whiteColor;
+        label.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+        label.backgroundColor = [UIColor colorWithWhite:0 alpha:0.75];
+        label.textAlignment = NSTextAlignmentCenter;
+        label.layer.cornerRadius = 8;
+        label.layer.masksToBounds = YES;
+        [label sizeToFit];
+        CGRect f = label.frame;
+        f.size.width += 24;
+        f.size.height += 16;
+        label.frame = f;
+        label.center = CGPointMake(win.bounds.size.width / 2.0, win.bounds.size.height - 100);
+        label.alpha = 0;
+        [win addSubview:label];
+        [UIView animateWithDuration:0.2 animations:^{ label.alpha = 1.0; } completion:^(BOOL finished) {
+            [UIView animateWithDuration:0.25 delay:1.2 options:0 animations:^{ label.alpha = 0; } completion:^(BOOL f2) {
+                [label removeFromSuperview];
+            }];
+        }];
+    });
 }
 
 static id UUViewModelFromVC(UIViewController *vc, Class vmCls) {
@@ -167,12 +254,151 @@ static int32_t UUScreenID(id screen) {
     return -1;
 }
 
+static int32_t UUViewportCurrentScreenID(id session);
+
+static NSInteger UUCurrentDisplayIndex(UIView *toolBar) {
+    id vm = UUFindViewModel(toolBar);
+    if (!vm) return -1;
+    id session = UUObjectIvar(vm, "session");
+    if (!session) return -1;
+
+    int32_t activeID = UUViewportCurrentScreenID(session);
+
+    uintptr_t raw = 0;
+    if (!UURawIvar(session, "screenInfos", &raw, sizeof(raw)) || !raw) {
+        NSNumber *saved = objc_getAssociatedObject(toolBar, &kAssocActiveIndex);
+        return saved ? saved.integerValue : -1;
+    }
+    if (raw & 0xC000000000000001ULL) {
+        NSNumber *saved = objc_getAssociatedObject(toolBar, &kAssocActiveIndex);
+        return saved ? saved.integerValue : -1;
+    }
+
+    NSInteger count = *(NSInteger *)(raw + 0x10);
+    if (count <= 0 || count > 16) {
+        NSNumber *saved = objc_getAssociatedObject(toolBar, &kAssocActiveIndex);
+        return saved ? saved.integerValue : -1;
+    }
+
+    void **items = (void **)(raw + 0x20);
+    for (NSInteger i = 0; i < count; i++) {
+        id screen = (__bridge id)items[i];
+        if (activeID >= 0 && UUScreenID(screen) == activeID) {
+            objc_setAssociatedObject(toolBar, &kAssocActiveIndex, @(i), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            return i;
+        }
+    }
+
+    if (activeID < 0) {
+        NSNumber *saved = objc_getAssociatedObject(toolBar, &kAssocActiveIndex);
+        return saved ? saved.integerValue : 0;
+    }
+    return -1;
+}
+
+static BOOL UUFunctionLoadsScreenIDSel(const uint32_t *insns, uintptr_t imageStart, uintptr_t imageEnd) {
+    for (size_t i = 0; i < 24; i++) {
+        uint32_t insn = insns[i];
+        if ((insn & 0x9f000000) != 0x90000000) continue;
+        int64_t immhi = (int32_t)((insn >> 5) & 0x7ffff);
+        immhi = (immhi << 13) >> 13;
+        int64_t immlo = (insn >> 29) & 0x3;
+        int64_t pageOffset = (immhi << 2) | immlo;
+        uintptr_t pcPage = ((uintptr_t)&insns[i]) & ~0xfffULL;
+        uintptr_t page = pcPage + (pageOffset << 12);
+        uint32_t reg = insn & 0x1f;
+
+        for (size_t j = i + 1; j < i + 8 && j < 24; j++) {
+            uint32_t next = insns[j];
+            uintptr_t target = 0;
+            if ((next & 0xffc00000) == 0x91000000 && ((next >> 5) & 0x1f) == reg) {
+                uint32_t imm12 = (next >> 10) & 0xfff;
+                target = page + imm12;
+            } else if ((next & 0xffc00000) == 0xf9400000 && ((next >> 5) & 0x1f) == reg) {
+                uint32_t imm12 = ((next >> 10) & 0xfff) << 3;
+                target = page + imm12;
+            }
+            if (target >= imageStart && target + 8 <= imageEnd) {
+                const char *candidate = (const char *)target;
+                if ((next & 0xffc00000) == 0xf9400000) {
+                    uintptr_t loaded = *(uintptr_t *)target;
+                    if (loaded >= imageStart && loaded < imageEnd) candidate = (const char *)loaded;
+                }
+                if (strncmp(candidate, "screen_id", 9) == 0) return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+static void *UUSwitchScreenFunction(void) {
+    static void *fn = NULL;
+    static BOOL resolved = NO;
+    if (resolved) return fn;
+    resolved = YES;
+
+    const struct mach_header_64 *mh = NULL;
+    intptr_t slide = 0;
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char *name = _dyld_get_image_name(i);
+        size_t len = name ? strlen(name) : 0;
+        if (len >= 15 && strcmp(name + len - 15, "/nrd-ios-client") == 0) {
+            mh = (const struct mach_header_64 *)_dyld_get_image_header(i);
+            slide = _dyld_get_image_vmaddr_slide(i);
+            break;
+        }
+    }
+    if (!mh) { UULog(@"main image not found"); return NULL; }
+
+    uintptr_t textStart = (uintptr_t)mh;
+    uintptr_t textEnd = textStart + 0x02600000ULL;
+    uintptr_t imageEnd = textStart + 0x04000000ULL;
+    const uint8_t *cmdPtr = (const uint8_t *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++) {
+        const struct load_command *lc = (const struct load_command *)cmdPtr;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)cmdPtr;
+            if (strcmp(seg->segname, "__TEXT") == 0) {
+                textStart = (uintptr_t)(seg->vmaddr + slide);
+                textEnd = textStart + (uintptr_t)seg->vmsize;
+            } else if (strcmp(seg->segname, "__LINKEDIT") != 0 && seg->vmsize > 0) {
+                uintptr_t segEnd = (uintptr_t)(seg->vmaddr + slide) + (uintptr_t)seg->vmsize;
+                if (segEnd > imageEnd) imageEnd = segEnd;
+            }
+        }
+        cmdPtr += lc->cmdsize;
+    }
+
+    Class vmCls = objc_getClass(kClsViewModel);
+    if (vmCls) {
+        uintptr_t *words = (uintptr_t *)(__bridge void *)vmCls;
+        for (size_t off = 0x50 / sizeof(uintptr_t); off < 0x1000 / sizeof(uintptr_t); off++) {
+            uintptr_t raw = words[off];
+            uintptr_t candidate = raw & 0x0000ffffffffffffULL;
+            if (candidate >= textStart + 0x4000 && candidate + 96 < textEnd && (candidate & 0x3) == 0) {
+                if (UUFunctionLoadsScreenIDSel((const uint32_t *)candidate, textStart, imageEnd)) {
+                    fn = (void *)candidate;
+                    UULog(@"resolved switchScreen via vtable[+0x%zx] = %p", off * sizeof(uintptr_t), fn);
+                    return fn;
+                }
+            }
+        }
+    }
+    UULog(@"switchScreen not found in vtable");
+    return NULL;
+}
+
 // ---- Viewport Memory & Position Fix ------------------------------------------
 
 @interface UUViewportSnapshot : NSObject
 @property (nonatomic) double zoom;
+@property (nonatomic) double minimumZoom, maximumZoom;
 @property (nonatomic) CGPoint offset;
 @property (nonatomic) CGSize frameSize;
+@property (nonatomic) CGSize contentSize;
+@property (nonatomic) CGSize boundsSize;
+@property (nonatomic) UIEdgeInsets contentInset;
 @end
 @implementation UUViewportSnapshot
 @end
@@ -184,29 +410,42 @@ static BOOL UUReadViewport(UIView *view, UUViewportSnapshot *snapshot) {
     if (!temp || !min || !content) return NO;
     ptrdiff_t offset = ivar_getOffset(temp);
     if (ivar_getOffset(min) != offset + 16 || ivar_getOffset(content) != offset + 32) return NO;
-    if (offset < 0 || (size_t)offset + 16 > class_getInstanceSize(view.class)) return NO;
+    if (offset < 0 || (size_t)offset + 32 > class_getInstanceSize(view.class)) return NO;
     double zoom;
     memcpy(&zoom, (uint8_t *)(__bridge void *)view + offset + 8, sizeof(double));
     snapshot.zoom = zoom;
+    double minimumZoom, maximumZoom;
+    if (!UURawIvar(view, "minimumZoomScale", &minimumZoom, sizeof(minimumZoom))) return NO;
+    memcpy(&maximumZoom, (uint8_t *)(__bridge void *)view + offset + 24, sizeof(maximumZoom));
+    snapshot.minimumZoom = minimumZoom;
+    snapshot.maximumZoom = maximumZoom;
     CGPoint position;
     CGSize frame;
     if (!UURawIvar(view, "_contentOffset", &position, sizeof(position)) ||
         !UURawIvar(view, "videoFrameSize", &frame, sizeof(frame))) return NO;
     snapshot.offset = position;
     snapshot.frameSize = frame;
+    CGSize contentSize;
+    UIEdgeInsets inset;
+    if (!UURawIvar(view, "_contentSize", &contentSize, sizeof(contentSize)) ||
+        !UURawIvar(view, "contentInset", &inset, sizeof(inset))) return NO;
+    snapshot.contentSize = contentSize;
+    snapshot.boundsSize = view.bounds.size;
+    snapshot.contentInset = inset;
     return isfinite(snapshot.zoom) && snapshot.zoom > 0.001 && snapshot.zoom < 128 &&
         isfinite(position.x) && isfinite(position.y) && fabs(position.x) < 1e7 && fabs(position.y) < 1e7 &&
         isfinite(frame.width) && isfinite(frame.height) && frame.width > 0 && frame.height > 0;
 }
 
 static int32_t UUViewportCurrentScreenID(id session) {
-    int32_t sid = UUScreenID(UUObjectIvar(session, "$__lazy_storage_$_currentScreenInfo"));
-    if (sid >= 0) return sid;
+    int32_t sid = -1;
     uint8_t optional[5] = {0, 0, 0, 0, 1};
     if (UURawIvar(session, "currentScreenID", optional, sizeof(optional)) && !(optional[4] & 1)) {
         memcpy(&sid, optional, sizeof(sid));
         if (sid >= 0) return sid;
     }
+    sid = UUScreenID(UUObjectIvar(session, "$__lazy_storage_$_currentScreenInfo"));
+    if (sid >= 0) return sid;
     uintptr_t raw = 0;
     if (UURawIvar(session, "screenInfos", &raw, sizeof(raw)) && raw && !(raw & 0xC000000000000001ULL)) {
         NSInteger count = *(NSInteger *)(raw + 0x10);
@@ -219,18 +458,24 @@ static BOOL UUViewportFunctions(void **zoom, void **offset) {
     if (!UUIsSupportedAppVersion()) return NO;
     intptr_t slide = UUMainImageSlide();
     if (!slide) return NO;
-    *zoom = (void *)(slide + 0x100849440);
-    *offset = (void *)(slide + 0x10084b0dc);
+    BOOL updated = UUAppLayout() == 443;
+    *zoom = (void *)(slide + (updated ? 0x100855f64 : 0x100849440));
+    *offset = (void *)(slide + (updated ? 0x100857c00 : 0x10084b0dc));
     return UUIsMainImagePointer(*zoom) && UUIsMainImagePointer(*offset) &&
-        memcmp(*zoom, (const uint32_t[]){0x6dbe23e9u, 0xa9017bfdu, 0x910043fdu, 0xb0010b68u}, 16) == 0 &&
+        memcmp(*zoom, (const uint32_t[]){0x6dbe23e9u, 0xa9017bfdu, 0x910043fdu, updated ? 0xd0010b88u : 0xb0010b68u}, 16) == 0 &&
         memcmp(*offset, (const uint32_t[]){0x6db923e9u, 0xa9016ffcu, 0xa90267fau, 0xa9035ff8u}, 16) == 0;
 }
 
-static BOOL UUApplyViewport(UIView *view, UUViewportSnapshot *saved) {
+static BOOL UUApplyViewport(UIView *view, id viewModel, UUViewportSnapshot *saved) {
     void *zoomFn = NULL, *offsetFn = NULL;
     if (!UUViewportFunctions(&zoomFn, &offsetFn)) return NO;
     UUViewportSnapshot *current = [UUViewportSnapshot new];
     if (!UUReadViewport(view, current)) return NO;
+    Ivar cache = class_getInstanceVariable(object_getClass(viewModel), "preStreamerTransform");
+    ptrdiff_t cacheOffset = cache ? ivar_getOffset(cache) : -1;
+    if (cacheOffset < 0 || (size_t)cacheOffset + 33 > class_getInstanceSize(object_getClass(viewModel))) return NO;
+    // The native sender otherwise suppresses an unchanged transform after the renderer resets.
+    *((uint8_t *)(__bridge void *)viewModel + cacheOffset + 32) = 1;
     CGPoint point = saved.offset;
     point.x *= current.frameSize.width / saved.frameSize.width;
     point.y *= current.frameSize.height / saved.frameSize.height;
@@ -264,6 +509,14 @@ static void UUForwardRenderTransform(UUDeferredRenderTransform *packet) {
     }
 }
 
+static void UURequestRenderDraw(id renderView) {
+    Class metal = objc_getClass("MetalView");
+    SEL draw = sel_registerName("draw");
+    if (metal && [renderView isKindOfClass:metal] && [renderView respondsToSelector:draw]) {
+        ((void (*)(id, SEL))(void *)objc_msgSend)(renderView, draw);
+    }
+}
+
 @class UUViewportMemory;
 static void UURefreshViewportBindings(UUViewportMemory *memory);
 
@@ -286,6 +539,7 @@ static void UURefreshViewportBindings(UUViewportMemory *memory);
 @property (nonatomic) int32_t targetID;
 @property (nonatomic) CFTimeInterval started;
 @property (nonatomic) BOOL applying;
+@property (nonatomic) BOOL tickScheduled;
 @property (nonatomic) BOOL restoringForeground;
 - (void)stop;
 - (void)start;
@@ -298,6 +552,7 @@ static void UURefreshViewportBindings(UUViewportMemory *memory);
 - (instancetype)init {
     if ((self = [super init])) {
         _screens = [NSMutableDictionary dictionary];
+        [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(settingsChanged:) name:UUSettingsChangedNotification object:nil];
         [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(willResign:) name:UIApplicationWillResignActiveNotification object:nil];
         [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(didBecomeActive:) name:UIApplicationWillEnterForegroundNotification object:nil];
         [NSNotificationCenter.defaultCenter addObserver:self selector:@selector(didBecomeActive:) name:UIApplicationDidBecomeActiveNotification object:nil];
@@ -333,7 +588,11 @@ static void UURefreshViewportBindings(UUViewportMemory *memory);
     }];
     [NSRunLoop.mainRunLoop addTimer:self.timer forMode:NSRunLoopCommonModes];
 }
+- (void)settingsChanged:(NSNotification *)note {
+    if (!UUFeatureEnabled(@"viewportMemory")) { [self stop]; [self.screens removeAllObjects]; }
+}
 - (void)willResign:(NSNotification *)note {
+    if (!UUFeatureEnabled(@"viewportMemory")) { [self stop]; return; }
     UURefreshViewportBindings(self);
     UUViewportSnapshot *snapshot = [UUViewportSnapshot new];
     int32_t sid = UUViewportCurrentScreenID(self.session);
@@ -347,6 +606,7 @@ static void UURefreshViewportBindings(UUViewportMemory *memory);
     [self stop];
 }
 - (void)didBecomeActive:(NSNotification *)note {
+    if (!UUFeatureEnabled(@"viewportMemory")) { [self stop]; return; }
     id vm = UUFindViewModel(nil);
     if (UUObjectIvar(vm, "session") == self.session) self.viewModel = vm;
     UURefreshViewportBindings(self);
@@ -362,6 +622,7 @@ static void UURefreshViewportBindings(UUViewportMemory *memory);
     [self tick:nil];
 }
 - (void)tick:(NSTimer *)timer {
+    if (!UUFeatureEnabled(@"viewportMemory")) { [self stop]; return; }
     if (self.applying || !self.pending) return;
     UURefreshViewportBindings(self);
     UIView *view = self.content;
@@ -372,22 +633,35 @@ static void UURefreshViewportBindings(UUViewportMemory *memory);
     if (!view.window) return;
     int32_t currentID = UUViewportCurrentScreenID(session);
     if (currentID != self.targetID && currentID != self.sourceID) { [self stop]; return; }
+    // Do not restore the outgoing display while the native screen switch is still in flight.
+    if (self.targetID != self.sourceID && currentID != self.targetID) return;
+    // New display frames may arrive without another transform change; draw them during the switch window.
+    if (timer && self.targetID != self.sourceID) UURequestRenderDraw(self.renderView);
     UUViewportSnapshot *desired = currentID == self.targetID ? self.pending : self.source;
     if (!desired) return;
     BOOL touching = NO, zooming = NO;
     UURawIvar(view, "isTouching", &touching, 1);
     UURawIvar(view, "isZooming", &zooming, 1);
     if (touching || zooming) { [self stop]; return; }
+    BOOL scrollEnabled = NO;
+    if (!UURawIvar(view, "isScrollEnabled", &scrollEnabled, sizeof(scrollEnabled)) || !scrollEnabled) return;
     UUViewportSnapshot *current = [UUViewportSnapshot new];
-    if (!UUReadViewport(view, current)) return;
+    if (!UUReadViewport(view, current) ||
+        !isfinite(current.contentSize.width) || !isfinite(current.contentSize.height) ||
+        current.contentSize.width <= 0 || current.contentSize.height <= 0 ||
+        current.boundsSize.width <= 0 || current.boundsSize.height <= 0) return;
     UUViewportSnapshot *last = self.lastApplied;
     BOOL changed = !last || self.lastDesired != desired || fabs(current.zoom - last.zoom) > 0.0001 ||
         fabs(current.offset.x - last.offset.x) > 0.25 || fabs(current.offset.y - last.offset.y) > 0.25 ||
-        !CGSizeEqualToSize(current.frameSize, last.frameSize);
+        current.minimumZoom != last.minimumZoom || current.maximumZoom != last.maximumZoom ||
+        !CGSizeEqualToSize(current.frameSize, last.frameSize) ||
+        !CGSizeEqualToSize(current.contentSize, last.contentSize) ||
+        !CGSizeEqualToSize(current.boundsSize, last.boundsSize) ||
+        !UIEdgeInsetsEqualToEdgeInsets(current.contentInset, last.contentInset);
     if (changed) {
         self.applying = YES;
         self.deferredTransform = nil;
-        BOOL ok = UUApplyViewport(view, desired);
+        BOOL ok = UUApplyViewport(view, self.viewModel, desired);
         UUDeferredRenderTransform *finalTransform = self.deferredTransform;
         self.deferredTransform = nil;
         if (ok && finalTransform) {
@@ -398,7 +672,7 @@ static void UURefreshViewportBindings(UUViewportMemory *memory);
         self.applying = NO;
         if (!ok) { [self stop]; return; }
         UUViewportSnapshot *applied = [UUViewportSnapshot new];
-        if (UUReadViewport(view, applied)) {
+        if (finalTransform && UUReadViewport(view, applied)) {
             self.lastApplied = applied;
             self.lastDesired = desired;
             if (self.restoringForeground) {
@@ -450,19 +724,48 @@ static void hook_render_transform(id self, SEL cmd, id view, uint64_t handle,
             memory.deferredTransform = packet;
             return;
         }
-        NSUInteger serial = memory.renderSerial;
-        [memory tick:nil];
-        UUDeferredRenderTransform *finalTransform = memory.lastRenderTransform;
-        if (memory.pending && finalTransform.renderView == view && finalTransform.handle == handle) {
-            if (serial == memory.renderSerial) UUForwardRenderTransform(finalTransform);
-            return;
+        UUDeferredRenderTransform *previous = memory.lastRenderTransform;
+        if (!previous || previous.renderView != view || previous.handle != handle ||
+            fabsf(previous.sx - sx) > 0.0001f || fabsf(previous.sy - sy) > 0.0001f ||
+            fabsf(previous.tx - tx) > 0.25f || fabsf(previous.ty - ty) > 0.25f ||
+            previous.px != px || previous.py != py) {
+            memory.lastApplied = nil;
+            memory.lastRenderTransform = nil;
+        }
+        if (!memory.tickScheduled) {
+            memory.tickScheduled = YES;
+            // Finish the native render callback before changing its geometry again.
+            dispatch_async(dispatch_get_main_queue(), ^{
+                memory.tickScheduled = NO;
+                [memory tick:nil];
+            });
         }
     }
     if (sOrigRenderTransform) ((UURenderTransformFn)sOrigRenderTransform)(self, cmd, view, handle, sx, sy, tx, ty, px, py);
 }
 
+static void hook_app_send_event(UIApplication *self, SEL cmd, UIEvent *event) {
+    if (event.type == UIEventTypeTouches) {
+        for (UITouch *touch in event.allTouches) {
+            if (touch.phase != UITouchPhaseBegan) continue;
+            id vm = UUFindViewModel(touch.view);
+            UUViewportMemory *memory = objc_getAssociatedObject(UUObjectIvar(vm, "session"), kUUAssocViewportMemory());
+            UIView *content = memory.content;
+            if (memory.pending && content.window && touch.window == content.window &&
+                CGRectContainsPoint(content.bounds, [touch locationInView:content])) {
+                // Yield before UIKit captures the pinch anchor and starting offset.
+                memory.lastApplied = nil;
+                [memory tick:nil];
+                [memory stop];
+            }
+        }
+    }
+    if (sOrigAppSendEvent) ((void (*)(id, SEL, id))sOrigAppSendEvent)(self, cmd, event);
+}
+
 static void hook_content_layout(UIView *self, SEL _cmd) {
     if (sOrigContentLayout) ((void (*)(id, SEL))sOrigContentLayout)(self, _cmd);
+    if (!UUFeatureEnabled(@"viewportMemory")) return;
     UUViewportMemory *memory = objc_getAssociatedObject(self, kUUAssocViewportMemory());
     if (!memory) {
         id vm = UUFindViewModel(self);
@@ -486,6 +789,7 @@ static void hook_content_layout(UIView *self, SEL _cmd) {
 }
 
 static UUViewportMemory *UUPrepareViewportSwitch(id vm, id session, id targetScreen) {
+    if (!UUFeatureEnabled(@"viewportMemory")) return nil;
     void *zoom = NULL, *offset = NULL;
     if (!UUViewportFunctions(&zoom, &offset)) return nil;
     UIViewController *vc = UUObjectIvar(vm, "contentViewController");
@@ -728,6 +1032,11 @@ static void UURestoreKeyboardFrames(UIViewController *vc) {
 }
 
 static void UUApplyKeyboardShortcuts(UIViewController *vc) {
+    if (!UUFeatureEnabled(@"shortcuts")) {
+        UURestoreKeyboardFrames(vc);
+        for (UIView *button in objc_getAssociatedObject(vc, &kAssocShortcutRow)) [button removeFromSuperview];
+        return;
+    }
     NSArray<UIView *> *buttons = UUFirstPageButtons(vc);
     if (!buttons.count) return;
     UIView *first = nil;
@@ -814,7 +1123,7 @@ static void UUApplyKeyboardShortcuts(UIViewController *vc) {
 }
 
 static BOOL UUSendKeyArray(UIViewController *vc, const uint8_t *codes, size_t count) {
-    if (!vc || !codes || count == 0 || count > 8) return NO;
+    if (!UUFeatureEnabled(@"shortcuts") || !vc || !codes || count == 0 || count > 8) return NO;
     if (!UUIsSupportedAppVersion()) return NO;
 
     void *existential[2] = {0};
@@ -830,12 +1139,12 @@ static BOOL UUSendKeyArray(UIViewController *vc, const uint8_t *codes, size_t co
     if (!slide) return NO;
 
     void *empty = dlsym(RTLD_DEFAULT, "__swiftEmptyArrayStorage");
-    if (!empty) empty = *(void **)(slide + 0x1026dc218);
+    if (!empty) empty = *(void **)(slide + (UUAppLayout() == 443 ? 0x1026e41b8 : 0x1026dc218));
     if (!empty) return NO;
     if (*(uint64_t *)((uint8_t *)empty + 0x10) != 0) return NO;
 
     typedef void *(*EnsureFn)(uint64_t, uint64_t, uint64_t, void *);
-    EnsureFn ensure = (EnsureFn)(slide + 0x10056d9e4);
+    EnsureFn ensure = (EnsureFn)(slide + (UUAppLayout() == 443 ? 0x100573564 : 0x10056d9e4));
     if (!UUIsMainImagePointer((void *)ensure)) return NO;
     if (!UUCodeStartsWith((void *)ensure, 0xa9bd57f6u)) return NO;
 
@@ -995,25 +1304,31 @@ static const double kWheelStep = 14.0 * M_PI / 180.0;
 }
 @end
 
-static void UUWheelSend(NSInteger dy) {
+static BOOL UUWheelFunctions(void **build, void **send) {
+    if (!UUIsSupportedAppVersion()) return NO;
     intptr_t slide = UUMainImageSlide();
-    if (!slide) return;
+    if (!slide) return NO;
+    BOOL updated = UUAppLayout() == 443;
+    *build = (void *)(slide + (updated ? 0x100276474 : 0x100277280));
+    *send = (void *)(slide + (updated ? 0x1007d26e4 : 0x1007c68d0));
+    return UUIsMainImagePointer(*build) && UUIsMainImagePointer(*send) &&
+        UUCodeStartsWith(*build, 0xa9bc5ff8u) && UUCodeStartsWith(*send, 0xd10203ffu);
+}
 
+static BOOL UUWheelSend(NSInteger dy) {
+    if (!UUFeatureEnabled(@"wheel")) return NO;
+    void *buildFn = NULL, *sendFn = NULL;
+    if (!UUWheelFunctions(&buildFn, &sendFn)) return NO;
     typedef struct { uint64_t a, b; } UUSwiftString;
-    UUSwiftString (*build)(int64_t, int64_t, int64_t, uint8_t) =
-        (UUSwiftString (*)(int64_t, int64_t, int64_t, uint8_t))(slide + 0x100277280);
-    void (*send)(void *, void *, uint64_t, uint64_t) =
-        (void (*)(void *, void *, uint64_t, uint64_t))(slide + 0x1007c68d0);
-
-    if (!UUIsMainImagePointer((void *)build) || !UUIsMainImagePointer((void *)send)) return;
-    if (!UUCodeStartsWith((void *)build, 0xa9bc5ff8u) ||
-        !UUCodeStartsWith((void *)send, 0xd10203ffu)) return;
-
+    UUSwiftString (*build)(int64_t, int64_t, int64_t, uint8_t) = buildFn;
+    void (*send)(void *, void *, uint64_t, uint64_t) = sendFn;
     UUSwiftString packet = build(0, dy, 0, 7);
+    if (!packet.b) return NO;
     uint64_t context[4] = { 0, 0, 1, 0 };
     send(context, context, packet.a, packet.b);
-
-    if (!(packet.b & 0x8000000000000000ULL)) UUSwiftRelease((void *)packet.a);
+    // Swift String stores its bridge object in the second word.
+    if (!(packet.b & 0x8000000000000000ULL)) UUSwiftRelease((void *)packet.b);
+    return YES;
 }
 
 @interface UUWheelArtworkMask : NSObject
@@ -1047,7 +1362,7 @@ static UUWheelDialView *UUEnsureDialForView(UIView *view) {
     BOOL enabled = NO, folded = NO;
     UURawIvar(view, "enableScrollScreen", &enabled, 1);
     UURawIvar(view, "isFold", &folded, 1);
-    if (!enabled || folded || mode.hidden || !mode.superview || !button.superview) {
+    if (!UUFeatureEnabled(@"wheel") || !enabled || folded || mode.hidden || !mode.superview || !button.superview) {
         UUSetWheelArtworkHidden(button, NO);
         UUSetWheelArtworkHidden(mode, NO);
         dial.hidden = YES;
@@ -1082,7 +1397,9 @@ static UUWheelDialView *UUEnsureDialForView(UIView *view) {
 
 static void UUWheelHandle(UIView *view, SEL cmd, UIGestureRecognizer *gesture, IMP original) {
     BOOL enabled = NO;
-    if (!UURawIvar(view, "enableScrollScreen", &enabled, 1) || !enabled) {
+    void *build = NULL, *send = NULL;
+    if (!UUFeatureEnabled(@"wheel") || !UURawIvar(view, "enableScrollScreen", &enabled, 1) || !enabled ||
+        !UUWheelFunctions(&build, &send)) {
         if (original) ((void (*)(id, SEL, id))original)(view, cmd, gesture);
         return;
     }
@@ -1159,7 +1476,7 @@ static void UUWheelHandle(UIView *view, SEL cmd, UIGestureRecognizer *gesture, I
         NSInteger sent = 0;
         while (fabs(state.accumulated) >= kWheelStep && sent < 4) {
             double sign = state.accumulated > 0 ? 1.0 : -1.0;
-            UUWheelSend(sign > 0 ? -120 : 120);
+            if (!UUWheelSend(sign > 0 ? -120 : 120)) break;
             state.accumulated -= sign * kWheelStep;
             sent++;
             [state.feedback selectionChanged];
@@ -1215,6 +1532,309 @@ static void hook_mouse_release(UIView *self, SEL _cmd) {
     UUEnsureDialForView(self);
 }
 
+static void UUSwitchToDisplay(UIView *toolBar, NSInteger index) {
+    if (!UUFeatureEnabled(@"displaySwitch")) return;
+    void *fn = UUSwitchScreenFunction();
+    if (!fn) {
+        UUToast(@"未找到切屏入口");
+        return;
+    }
+
+    id vm = UUFindViewModel(toolBar);
+    if (!vm) { UUToast(@"未找到远控会话"); return; }
+    id session = UUObjectIvar(vm, "session");
+    if (!session) { UUToast(@"会话未建立"); return; }
+
+    uintptr_t raw = 0;
+    if (!UURawIvar(session, "screenInfos", &raw, sizeof(raw)) || !raw) {
+        UUToast(@"未读取到屏幕列表");
+        return;
+    }
+    if (raw & 0xC000000000000001ULL) {
+        UUToast(@"屏幕列表被锁定");
+        return;
+    }
+
+    NSInteger count = *(NSInteger *)(raw + 0x10);
+    if (count <= 0 || count > 16) {
+        UUToast(@"屏幕列表数量异常");
+        return;
+    }
+
+    if (index < 0 || index >= count) {
+        UUToast([NSString stringWithFormat:@"当前仅检测到 %ld 台显示器", (long)count]);
+        return;
+    }
+
+    void **items = (void **)(raw + 0x20);
+    id targetScreen = (__bridge id)items[index];
+
+    int32_t activeID = UUViewportCurrentScreenID(session);
+    if (activeID == UUScreenID(targetScreen)) {
+        UUToast([NSString stringWithFormat:@"当前已是显示器%ld", (long)(index + 1)]);
+        return;
+    }
+
+    UUViewportMemory *memory = UUPrepareViewportSwitch(vm, session, targetScreen);
+
+    uuss_call_swift_method(fn, (__bridge void *)vm, (__bridge void *)targetScreen);
+
+    objc_setAssociatedObject(toolBar, &kAssocActiveIndex, @(index), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    UUUpdateToolBar(toolBar);
+
+    if (memory) {
+        [memory start];
+        [memory tick:nil];
+    }
+}
+
+// ---- Toolbar Replacement & Blue Indicator ------------------------------------
+
+static UIColor *UUActiveBlueColor(void) {
+    return [UIColor colorWithRed:0x3A / 255.0 green:0x7B / 255.0 blue:0xFB / 255.0 alpha:1.0];
+}
+
+static UIImageView *UUFirstImageView(UIView *v) {
+    if ([v isKindOfClass:[UIImageView class]]) return (UIImageView *)v;
+    for (UIView *sub in v.subviews) {
+        UIImageView *iv = UUFirstImageView(sub);
+        if (iv) return iv;
+    }
+    return nil;
+}
+
+static UILabel *UUItemLabel(UIView *item) {
+    id l = UUObjectIvar(item, "$__lazy_storage_$_captionLabel") ?: UUObjectIvar(item, "textLabel");
+    if ([l isKindOfClass:[UILabel class]]) return (UILabel *)l;
+    return UUFirstLabel(item);
+}
+
+static UIImageView *UUItemIcon(UIView *item) {
+    id iv = UUObjectIvar(item, "$__lazy_storage_$_icon") ?: UUObjectIvar(item, "iconImageView");
+    if ([iv isKindOfClass:[UIImageView class]]) return (UIImageView *)iv;
+    return UUFirstImageView(item);
+}
+
+static BOOL UUTextMatchesKeys(NSString *text, NSArray<NSString *> *keys) {
+    if (!text.length) return NO;
+    for (NSString *k in keys) {
+        if ([text containsString:k]) return YES;
+    }
+    return NO;
+}
+
+static NSInteger UUClassifyItem(UIView *item) {
+    uint8_t rawType = 0;
+    if (UURawIvar(item, "type", &rawType, sizeof(rawType)) || UURawIvar(item, "itemType", &rawType, sizeof(rawType))) {
+        if (rawType == kItemTypeExpandAllWindows) return 0;
+        if (rawType == kItemTypeShowDesktop)      return 1;
+        return -1;
+    }
+    UILabel *label = UUItemLabel(item);
+    NSString *text = label.text ?: @"";
+    if (UUTextMatchesKeys(text, @[@"展开所有窗口", @"展开全部窗口", @"展开", @"所有窗口", @"全部窗口", @"显示器1"])) return 0;
+    if (UUTextMatchesKeys(text, @[@"显示桌面", @"回到桌面", @"桌面", @"显示器2"])) return 1;
+    return -1;
+}
+
+static UIImage *UUDisplayIcon(NSInteger index, CGSize size, UIColor *color) {
+    if (size.width <= 0 || size.height <= 0) size = CGSizeMake(24, 24);
+    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
+    fmt.opaque = NO;
+    fmt.scale = UIScreen.mainScreen.scale;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:size format:fmt];
+    return [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        CGContextRef c = ctx.CGContext;
+        [color setStroke];
+        [color setFill];
+        CGContextSetLineWidth(c, 1.5);
+        CGContextSetLineJoin(c, kCGLineJoinRound);
+        CGContextSetLineCap(c, kCGLineCapRound);
+
+        CGRect screenRect = CGRectMake(2.5, 3.5, size.width - 5.0, size.height - 10.0);
+        UIBezierPath *screenPath = [UIBezierPath bezierPathWithRoundedRect:screenRect cornerRadius:2.0];
+        screenPath.lineWidth = 1.5;
+        [screenPath stroke];
+
+        CGFloat midX = size.width / 2.0;
+        CGFloat standTop = CGRectGetMaxY(screenRect);
+        CGFloat standBottom = size.height - 3.5;
+        UIBezierPath *stand = [UIBezierPath bezierPath];
+        [stand moveToPoint:CGPointMake(midX, standTop)];
+        [stand addLineToPoint:CGPointMake(midX, standBottom)];
+        [stand stroke];
+
+        UIBezierPath *base = [UIBezierPath bezierPath];
+        [base moveToPoint:CGPointMake(midX - 4.5, standBottom)];
+        [base addLineToPoint:CGPointMake(midX + 4.5, standBottom)];
+        [base stroke];
+
+        NSString *numStr = (index == 0) ? @"1" : @"2";
+        NSDictionary *attrs = @{
+            NSFontAttributeName: [UIFont systemFontOfSize:9.0 weight:UIFontWeightBold],
+            NSForegroundColorAttributeName: color,
+        };
+        CGSize strSize = [numStr sizeWithAttributes:attrs];
+        CGRect strRect = CGRectMake(
+            midX - strSize.width / 2.0,
+            screenRect.origin.y + (screenRect.size.height - strSize.height) / 2.0 - 0.5,
+            strSize.width,
+            strSize.height
+        );
+        [numStr drawInRect:strRect withAttributes:attrs];
+    }];
+}
+
+static void UUStyleItem(UIView *item, NSInteger index, BOOL active) {
+    UILabel *label = UUItemLabel(item);
+    UIImageView *icon = UUItemIcon(item);
+
+    // A native press can temporarily turn the label blue; never cache that as the idle color.
+    UIColor *normal = [UIColor colorNamed:@"white" inBundle:NSBundle.mainBundle compatibleWithTraitCollection:item.traitCollection] ?: UIColor.whiteColor;
+    if (!objc_getAssociatedObject(item, &kAssocToolbarAppearance)) {
+        NSDictionary *appearance = @{@"text": label.text ?: @"", @"color": normal,
+            @"image": icon.image ?: NSNull.null, @"tint": normal};
+        objc_setAssociatedObject(item, &kAssocToolbarAppearance, appearance, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    UIColor *targetColor = active ? UUActiveBlueColor() : normal;
+
+    NSString *title = (index == 0) ? @"显示器1" : @"显示器2";
+    if (label) {
+        if (![label.text isEqualToString:title]) {
+            label.text = title;
+            UUInvalidateNativeLabel(label);
+            [item setNeedsLayout];
+        }
+        label.textColor = targetColor;
+    }
+
+    if (icon) {
+        CGSize sz = icon.bounds.size;
+        if (sz.width <= 0 || sz.height <= 0) sz = CGSizeMake(24, 24);
+        icon.image = UUDisplayIcon(index, sz, targetColor);
+        if ([icon respondsToSelector:@selector(setTintColor:)]) {
+            icon.tintColor = targetColor;
+        }
+    }
+}
+
+static void UUCollectItems(UIView *v, Class itemCls, NSMutableArray *out, int depth) {
+    if (!v || depth > 4) return;
+    if (itemCls && [v isKindOfClass:itemCls]) {
+        [out addObject:v];
+        return;
+    }
+    for (UIView *sub in v.subviews) UUCollectItems(sub, itemCls, out, depth + 1);
+}
+
+@interface UUToolBarWatcher : NSObject
+@property (nonatomic, weak) UIView *toolBar;
+@property (nonatomic, strong) NSTimer *timer;
+@end
+@implementation UUToolBarWatcher
+- (void)tick {
+    UIView *tb = self.toolBar;
+    if (!tb || !tb.window) {
+        [self.timer invalidate];
+        self.timer = nil;
+        return;
+    }
+    UUUpdateToolBar(tb);
+}
+@end
+
+static void UUEnsureWatcher(UIView *toolBar) {
+    UUToolBarWatcher *w = objc_getAssociatedObject(toolBar, &kAssocToolBarWatcher);
+    if (w.timer) return;
+    if (!w) w = [UUToolBarWatcher new];
+    w.toolBar = toolBar;
+    w.timer = [NSTimer scheduledTimerWithTimeInterval:0.5 target:w selector:@selector(tick) userInfo:nil repeats:YES];
+    objc_setAssociatedObject(toolBar, &kAssocToolBarWatcher, w, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void UUUpdateToolBar(UIView *toolBar) {
+    Class itemCls = UUItemClass();
+    NSMutableArray *items = [NSMutableArray array];
+    UUCollectItems(toolBar, itemCls, items, 0);
+
+    if (!UUFeatureEnabled(@"displaySwitch")) {
+        UUToolBarWatcher *watcher = objc_getAssociatedObject(toolBar, &kAssocToolBarWatcher);
+        [watcher.timer invalidate]; watcher.timer = nil;
+        for (UIView *item in items) {
+            NSDictionary *appearance = objc_getAssociatedObject(item, &kAssocToolbarAppearance);
+            if (!appearance) continue;
+            UILabel *label = UUItemLabel(item);
+            UIImageView *icon = UUItemIcon(item);
+            label.text = appearance[@"text"]; label.textColor = appearance[@"color"];
+            UUInvalidateNativeLabel(label); [item setNeedsLayout];
+            icon.image = appearance[@"image"] == NSNull.null ? nil : appearance[@"image"];
+            icon.tintColor = appearance[@"tint"] == NSNull.null ? nil : appearance[@"tint"];
+            objc_setAssociatedObject(item, &kAssocToolbarAppearance, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(item, &kAssocDisplayIndex, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+        return;
+    }
+    NSInteger activeIdx = UUCurrentDisplayIndex(toolBar);
+    UUEnsureWatcher(toolBar);
+
+    for (UIView *item in items) {
+        NSInteger kind = UUClassifyItem(item);
+        if (kind == 0 || kind == 1) {
+            objc_setAssociatedObject(item, &kAssocDisplayIndex, @(kind), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            UUStyleItem(item, kind, activeIdx == kind);
+        } else {
+            objc_setAssociatedObject(item, &kAssocDisplayIndex, @(-1), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+    }
+}
+
+// ---- Hooks -------------------------------------------------------------------
+
+static void hook_layoutSubviews(UIView *self, SEL _cmd) {
+    if (sOrigLayout) ((void (*)(id, SEL))sOrigLayout)(self, _cmd);
+    @try {
+        UUUpdateToolBar(self);
+    } @catch (NSException *e) {
+        UULog(@"layout exception: %@", e);
+    }
+}
+
+static void hook_didClickButton(UIView *self, SEL _cmd, id sender) {
+    if (!UUFeatureEnabled(@"displaySwitch")) {
+        if (sOrigDidClick) ((void (*)(id, SEL, id))sOrigDidClick)(self, _cmd, sender);
+        return;
+    }
+    UIView *v = nil;
+    if ([sender isKindOfClass:[UIGestureRecognizer class]]) v = ((UIGestureRecognizer *)sender).view;
+    else if ([sender isKindOfClass:[UIView class]]) v = sender;
+
+    Class itemCls = UUItemClass();
+    for (int d = 0; v && v != self && d < 6; d++, v = v.superview) {
+        if (itemCls && [v isKindOfClass:itemCls]) {
+            NSNumber *idx = objc_getAssociatedObject(v, &kAssocDisplayIndex);
+            if (idx && (idx.integerValue == 0 || idx.integerValue == 1)) {
+                UUSwitchToDisplay(self, idx.integerValue);
+                return;
+            }
+            break;
+        }
+    }
+    if (sOrigDidClick) ((void (*)(id, SEL, id))sOrigDidClick)(self, _cmd, sender);
+}
+
+static void UURefreshFeatureTree(UIView *view) {
+    if ([view isKindOfClass:objc_getClass(kClsToolBar)]) UUUpdateToolBar(view);
+    if ([view isKindOfClass:objc_getClass(kClsMouse)]) UUEnsureDialForView(view);
+    if ([view isKindOfClass:objc_getClass("_TtC14nrd_ios_client17RemoteContentView")]) [view setNeedsLayout];
+    if ([view.nextResponder isKindOfClass:objc_getClass(kClsCombineKey)]) {
+        UIViewController *vc = (UIViewController *)view.nextResponder;
+        UURestoreKeyboardFrames(vc);
+        [vc.view setNeedsLayout];
+        if (!UUFeatureEnabled(@"shortcuts")) UUApplyKeyboardShortcuts(vc);
+    }
+    for (UIView *child in view.subviews) UURefreshFeatureTree(child);
+}
+
 // ---- Hooks Installation ------------------------------------------------------
 
 static BOOL UUHook(Class cls, SEL sel, IMP imp, IMP *orig) {
@@ -1234,6 +1854,14 @@ static BOOL UUHook(Class cls, SEL sel, IMP imp, IMP *orig) {
 }
 
 static void UUInstall(void) {
+    UUInstallSettings();
+    static BOOL toolbarTried = NO;
+    Class toolbar = objc_getClass(kClsToolBar);
+    if (!toolbarTried && toolbar && UUIsSupportedAppVersion()) {
+        toolbarTried = YES;
+        UUHook(toolbar, @selector(layoutSubviews), (IMP)hook_layoutSubviews, &sOrigLayout);
+        UUHook(toolbar, @selector(didClickButton:), (IMP)hook_didClickButton, &sOrigDidClick);
+    }
     static BOOL keyboardTried = NO, wheelTried = NO, menuTried = NO;
 
     Class ck = objc_getClass(kClsCombineKey);
@@ -1278,6 +1906,9 @@ static void UUInstall(void) {
     SEL engineKey = kUUViewportEngineActive();
     if (!objc_getAssociatedObject(UIApplication.sharedApplication, engineKey)) {
         static BOOL renderTried = NO, contentTried = NO;
+        if (!sOrigAppSendEvent) {
+            UUHook(UIApplication.class, @selector(sendEvent:), (IMP)hook_app_send_event, &sOrigAppSendEvent);
+        }
         Class renderer = objc_getClass("StreamerManager");
         if (!renderTried && renderer && UUIsSupportedAppVersion()) {
             renderTried = YES;
@@ -1312,6 +1943,12 @@ __attribute__((constructor)) static void UUInit(void) {
         NSString *bid = NSBundle.mainBundle.bundleIdentifier;
         if (![bid isEqualToString:@"com.netease.uuremote"]) return;
         NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
+        [nc addObserverForName:UUSettingsChangedNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification *note) {
+            for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
+                if (![scene isKindOfClass:UIWindowScene.class]) continue;
+                for (UIWindow *window in ((UIWindowScene *)scene).windows) UURefreshFeatureTree(window);
+            }
+        }];
         [nc addObserverForName:UIApplicationDidFinishLaunchingNotification
                         object:nil
                          queue:NSOperationQueue.mainQueue

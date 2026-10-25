@@ -48,6 +48,9 @@ def check_deb(deb, expect_pkg, expect_arch, expect_prefix, expect_rpath):
     assert fields['Author'] == 'junhong', fields
     assert fields['Maintainer'] == 'junhong', fields
     assert fields['Depends'] == 'firmware (>= 15.0)', fields
+    assert set(fields['Conflicts'].split(', ')) == {'im.mjh.uuscreenswitch', 'im.mjh.uuscreenswitch.roothide'}, fields
+    assert fields['Replaces'] == fields['Conflicts'], fields
+    assert fields['Version'] in deb.name, fields
 
     with tempfile.TemporaryDirectory() as td:
         subprocess.check_call(['/opt/homebrew/bin/dpkg-deb', '-x', str(deb), td])
@@ -62,7 +65,7 @@ def check_deb(deb, expect_pkg, expect_arch, expect_prefix, expect_rpath):
             assert otool_l.count('cmd LC_RPATH') >= 2, "Missing LC_RPATH in roothide dylib"
         assert b'com.netease.uuremote' in plist.read_bytes()
         data = dylib.read_bytes()
-        for s in ['_TtC14nrd_ios_client24CombineKeyViewController', '_TtC14nrd_ios_client9MouseView', 'Shift+Enter']:
+        for s in ['_TtC14nrd_ios_client24CombineKeyViewController', '_TtC14nrd_ios_client9MouseView', 'Shift+Enter', '_TtC14nrd_ios_client13RemoteToolBar', '_TtC14nrd_ios_client25MineSettingTableViewModel', '_TtC14nrd_ios_client22MineSettingsSwitchCell', 'im.mjh.uuhelper', 'displaySwitch', 'viewportMemory']:
             assert s.encode('utf-8') in data or s.encode('utf-16-le') in data, f"Missing string {s}"
     print(f"[OK] {deb.name}: Package={fields['Package']} Arch={fields['Architecture']} Version={fields['Version']}")
 

@@ -1,9 +1,11 @@
 Package: uuhelper
 Name: uu 远控增强
-Version: 1.0.1
+Version: 1.0.2
 Architecture: iphoneos-arm64
-Description: UU 远控常用组合键、圆环滚轮与显示器视角记忆增强。
+Description: UU 远控快捷键、圆盘滚轮、快捷切屏与视角记忆，支持 App 内独立开关。
 Maintainer: junhong
 Author: junhong
 Section: Tweaks
 Depends: firmware (>= 15.0)
+Conflicts: im.mjh.uuscreenswitch, im.mjh.uuscreenswitch.roothide
+Replaces: im.mjh.uuscreenswitch, im.mjh.uuscreenswitch.roothide

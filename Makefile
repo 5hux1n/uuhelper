@@ -9,7 +9,7 @@ BASE_PACKAGE = uuhelper
 include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = uuhelper
-uuhelper_FILES = Tweak.m Trampoline.S
+uuhelper_FILES = Tweak.m UUSettings.m Trampoline.S
 uuhelper_CFLAGS = -fobjc-arc -Wall -Wextra -Wno-unused-parameter -Wno-deprecated-declarations -Wno-cast-function-type-mismatch -fmodules-cache-path=/tmp/uuhelper-$(THEOS_PACKAGE_SCHEME)-modules
 uuhelper_FRAMEWORKS = UIKit Foundation QuartzCore
 uuhelper_USE_SUBSTRATE = 0
