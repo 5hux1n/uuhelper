@@ -1,6 +1,6 @@
 Package: uuhelper
 Name: uu 远控增强
-Version: 1.0.2
+Version: 1.0.3
 Architecture: iphoneos-arm64
 Description: UU 远控快捷键、圆盘滚轮、快捷切屏与视角记忆，支持 App 内独立开关。
 Maintainer: junhong

@@ -3,12 +3,16 @@
 #import <objc/message.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
+#import <mach-o/getsect.h>
 #import <dlfcn.h>
 #import <math.h>
 #import "UUSettings.h"
+#import "NativeFunctions.h"
 
 extern void uuss_call_swift_method(void *fn, void *swiftSelf, void *arg0);
 extern void uuss_call_key_sink(void *fn, void *sink, void *array, uint8_t action, void *type, void *wtable);
+extern bool uu_send_key_array(const uint8_t *codes, intptr_t count, void *fn, void *sink, void *type,
+                              void *wtable, void (*callback)(void *, void *, void *, uint8_t, void *, void *));
 extern void uuss_call_swift_geometry(void *fn, void *swiftSelf, double a, double b);
 
 #define UULog(fmt, ...) NSLog(@"[uuhelper] " fmt, ##__VA_ARGS__)
@@ -63,34 +67,26 @@ static IMP sOrigAppSendEvent = NULL;
 
 // ---- Helpers -----------------------------------------------------------------
 
-static intptr_t UUMainImageSlide(void) {
-    static intptr_t slide = 0;
-    static BOOL resolved = NO;
-    if (resolved) return slide;
-    resolved = YES;
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        size_t len = name ? strlen(name) : 0;
-        if (len >= 15 && strcmp(name + len - 15, "/nrd-ios-client") == 0) {
-            slide = _dyld_get_image_vmaddr_slide(i);
+static void *UUNativeEntry(UUNativeFunction function) {
+    static const void *entries[UUNativeFunctionCount];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        for (uint32_t i = 0; i < _dyld_image_count(); i++) {
+            const char *name = _dyld_get_image_name(i);
+            size_t length = name ? strlen(name) : 0;
+            if (length < 15 || strcmp(name + length - 15, "/nrd-ios-client")) continue;
+            const struct mach_header_64 *header = (const struct mach_header_64 *)_dyld_get_image_header(i);
+            const struct section_64 *section = getsectbynamefromheader_64(header, "__TEXT", "__text");
+            if (!section) break;
+            const uint32_t *text = (const uint32_t *)(section->addr + _dyld_get_image_vmaddr_slide(i));
+            for (int kind = 0; kind < UUNativeFunctionCount; kind++) {
+                entries[kind] = UUResolveNativeFunction(text, section->size, kind);
+                UULog(@"native entry %d: %@", kind, entries[kind] ? @"resolved" : @"unavailable");
+            }
             break;
         }
-    }
-    return slide;
-}
-
-static NSInteger UUAppLayout(void) {
-    NSDictionary *info = NSBundle.mainBundle.infoDictionary;
-    NSString *version = info[@"CFBundleShortVersionString"];
-    NSString *build = info[@"CFBundleVersion"];
-    if ([version isEqualToString:@"4.42.0"] && [build isEqualToString:@"193"]) return 442;
-    if ([version isEqualToString:@"4.43.0"] && [build isEqualToString:@"195"]) return 443;
-    return 0;
-}
-
-static BOOL UUIsSupportedAppVersion(void) {
-    return UUAppLayout() != 0;
+    });
+    return function >= 0 && function < UUNativeFunctionCount ? (void *)entries[function] : NULL;
 }
 
 static BOOL UUIsMainImagePointer(void *ptr) {
@@ -99,10 +95,6 @@ static BOOL UUIsMainImagePointer(void *ptr) {
     if (!dladdr(ptr, &info) || !info.dli_fname) return NO;
     size_t len = strlen(info.dli_fname);
     return len >= 15 && strcmp(info.dli_fname + len - 15, "/nrd-ios-client") == 0;
-}
-
-static BOOL UUCodeStartsWith(void *fn, uint32_t insn) {
-    return fn && *(const uint32_t *)fn == insn;
 }
 
 static void UUSwiftRelease(void *object) {
@@ -455,15 +447,9 @@ static int32_t UUViewportCurrentScreenID(id session) {
 }
 
 static BOOL UUViewportFunctions(void **zoom, void **offset) {
-    if (!UUIsSupportedAppVersion()) return NO;
-    intptr_t slide = UUMainImageSlide();
-    if (!slide) return NO;
-    BOOL updated = UUAppLayout() == 443;
-    *zoom = (void *)(slide + (updated ? 0x100855f64 : 0x100849440));
-    *offset = (void *)(slide + (updated ? 0x100857c00 : 0x10084b0dc));
-    return UUIsMainImagePointer(*zoom) && UUIsMainImagePointer(*offset) &&
-        memcmp(*zoom, (const uint32_t[]){0x6dbe23e9u, 0xa9017bfdu, 0x910043fdu, updated ? 0xd0010b88u : 0xb0010b68u}, 16) == 0 &&
-        memcmp(*offset, (const uint32_t[]){0x6db923e9u, 0xa9016ffcu, 0xa90267fau, 0xa9035ff8u}, 16) == 0;
+    *zoom = UUNativeEntry(UUZoom);
+    *offset = UUNativeEntry(UUOffset);
+    return *zoom && *offset;
 }
 
 static BOOL UUApplyViewport(UIView *view, id viewModel, UUViewportSnapshot *saved) {
@@ -1124,7 +1110,6 @@ static void UUApplyKeyboardShortcuts(UIViewController *vc) {
 
 static BOOL UUSendKeyArray(UIViewController *vc, const uint8_t *codes, size_t count) {
     if (!UUFeatureEnabled(@"shortcuts") || !vc || !codes || count == 0 || count > 8) return NO;
-    if (!UUIsSupportedAppVersion()) return NO;
 
     void *existential[2] = {0};
     if (!UURawIvar(vc, "keyboardEventSink", existential, sizeof(existential))) return NO;
@@ -1135,34 +1120,11 @@ static BOOL UUSendKeyArray(UIViewController *vc, const uint8_t *codes, size_t co
     void *fn = *(void **)((uint8_t *)wtable + 8);
     if (!fn || !UUIsMainImagePointer(fn)) return NO;
 
-    intptr_t slide = UUMainImageSlide();
-    if (!slide) return NO;
-
-    void *empty = dlsym(RTLD_DEFAULT, "__swiftEmptyArrayStorage");
-    if (!empty) empty = *(void **)(slide + (UUAppLayout() == 443 ? 0x1026e41b8 : 0x1026dc218));
-    if (!empty) return NO;
-    if (*(uint64_t *)((uint8_t *)empty + 0x10) != 0) return NO;
-
-    typedef void *(*EnsureFn)(uint64_t, uint64_t, uint64_t, void *);
-    EnsureFn ensure = (EnsureFn)(slide + (UUAppLayout() == 443 ? 0x100573564 : 0x10056d9e4));
-    if (!UUIsMainImagePointer((void *)ensure)) return NO;
-    if (!UUCodeStartsWith((void *)ensure, 0xa9bd57f6u)) return NO;
-
-    void *storage = ensure(0, count, 1, empty);
-    if (!storage) return NO;
-
-    *(uint64_t *)((uint8_t *)storage + 0x10) = count;
-    for (size_t i = 0; i < count; i++) {
-        *(uint64_t *)((uint8_t *)storage + 0x20 + i * sizeof(uint64_t)) = codes[i];
-    }
 
     void *(*getType)(void *) = dlsym(RTLD_DEFAULT, "swift_getObjectType");
-    if (!getType) { UUSwiftRelease(storage); return NO; }
+    if (!getType) return NO;
     void *type = getType(sink);
-    uuss_call_key_sink(fn, sink, storage, 2, type, wtable);
-
-    UUSwiftRelease(storage);
-    return YES;
+    return uu_send_key_array(codes, count, fn, sink, type, wtable, uuss_call_key_sink);
 }
 
 static void UUSendShortcut(UIViewController *vc, UIView *source, UIView *templateButton, NSInteger index) {
@@ -1305,14 +1267,9 @@ static const double kWheelStep = 14.0 * M_PI / 180.0;
 @end
 
 static BOOL UUWheelFunctions(void **build, void **send) {
-    if (!UUIsSupportedAppVersion()) return NO;
-    intptr_t slide = UUMainImageSlide();
-    if (!slide) return NO;
-    BOOL updated = UUAppLayout() == 443;
-    *build = (void *)(slide + (updated ? 0x100276474 : 0x100277280));
-    *send = (void *)(slide + (updated ? 0x1007d26e4 : 0x1007c68d0));
-    return UUIsMainImagePointer(*build) && UUIsMainImagePointer(*send) &&
-        UUCodeStartsWith(*build, 0xa9bc5ff8u) && UUCodeStartsWith(*send, 0xd10203ffu);
+    *build = UUNativeEntry(UUWheelBuild);
+    *send = UUNativeEntry(UUWheelTransport);
+    return *build && *send;
 }
 
 static BOOL UUWheelSend(NSInteger dy) {
@@ -1516,7 +1473,7 @@ static void hook_wheel(UIView *self, SEL _cmd, UIGestureRecognizer *sender) {
 static void hook_mouse_layout(UIView *self, SEL _cmd) {
     if (sOrigMouseLayout) ((void (*)(id, SEL))sOrigMouseLayout)(self, _cmd);
     @try {
-        if (UUIsSupportedAppVersion()) UUEnsureDialForView(self);
+        UUEnsureDialForView(self);
     } @catch (NSException *e) {
         UULog(@"mouse layout exception: %@", e);
     }
@@ -1857,7 +1814,7 @@ static void UUInstall(void) {
     UUInstallSettings();
     static BOOL toolbarTried = NO;
     Class toolbar = objc_getClass(kClsToolBar);
-    if (!toolbarTried && toolbar && UUIsSupportedAppVersion()) {
+    if (!toolbarTried && toolbar) {
         toolbarTried = YES;
         UUHook(toolbar, @selector(layoutSubviews), (IMP)hook_layoutSubviews, &sOrigLayout);
         UUHook(toolbar, @selector(didClickButton:), (IMP)hook_didClickButton, &sOrigDidClick);
@@ -1879,7 +1836,8 @@ static void UUInstall(void) {
     Class mouse = objc_getClass(kClsMouse);
     if (!wheelTried && mouse) {
         wheelTried = YES;
-        if (UUIsSupportedAppVersion()) {
+        void *build = NULL, *send = NULL;
+        if (UUWheelFunctions(&build, &send)) {
             BOOL w = UUHook(mouse, @selector(mouseScrollActionWithSender:), (IMP)hook_wheel, &sOrigWheel);
             BOOL ml = UUHook(mouse, @selector(layoutSubviews), (IMP)hook_mouse_layout, &sOrigMouseLayout);
             BOOL p = UUHook(mouse, @selector(mouseScrollButtonPress), (IMP)hook_mouse_press, &sOrigMousePress);
@@ -1910,7 +1868,7 @@ static void UUInstall(void) {
             UUHook(UIApplication.class, @selector(sendEvent:), (IMP)hook_app_send_event, &sOrigAppSendEvent);
         }
         Class renderer = objc_getClass("StreamerManager");
-        if (!renderTried && renderer && UUIsSupportedAppVersion()) {
+        if (!renderTried && renderer) {
             renderTried = YES;
             SEL sel = sel_registerName(kRenderTransformSelector);
             Method method = class_getInstanceMethod(renderer, sel);
@@ -1926,7 +1884,7 @@ static void UUInstall(void) {
         }
 
         Class content = objc_getClass("_TtC14nrd_ios_client17RemoteContentView");
-        if (!contentTried && content && UUIsSupportedAppVersion()) {
+        if (!contentTried && content) {
             contentTried = YES;
             BOOL c = UUHook(content, @selector(layoutSubviews), (IMP)hook_content_layout, &sOrigContentLayout);
             UULog(@"viewport layout hook=%d", c);

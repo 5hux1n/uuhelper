@@ -6,7 +6,7 @@
 
 UU 远程 iOS 客户端增强插件，支持 iOS 15.0 及以上。按需启用常用组合快捷键、圆盘鼠标滚轮、快捷切屏和缩放位置记忆。
 
-当前版本：**1.0.2**。支持 UU 4.42.0（193）和 4.43.0（195）。
+当前版本：**1.0.3**。适配 UU 4.42.0（193）、4.43.0（195）和 4.45.0（197），不再按客户端版本号限制启用。
 
 ## 功能
 
@@ -22,20 +22,22 @@ UU 远程 iOS 客户端增强插件，支持 iOS 15.0 及以上。按需启用�
 
 合并版包含原「UU远控切屏」的功能，以后只维护 uuhelper。安装包已声明与旧切屏包互斥，包管理器安装时会要求替换旧切屏插件；普通更新不会清除已保存的开关选择。
 
-已安装测试包的用户，请在包管理器中手动选择正式版 1.0.2 覆盖安装。
-
 ## 正式版下载
 
-正式版本：**1.0.2**。包名：`uuhelper`（RootHide 为 `uuhelper.roothide`）。
+正式版本：**1.0.3**。包名：`uuhelper`（RootHide 为 `uuhelper.roothide`）。
 
 | 环境 | 下载 |
 |---|---|
-| Rootless | [uuhelper_1.0.2_arm64.deb](https://github.com/5hux1n/uuhelper/releases/download/v1.0.2/uuhelper_1.0.2_arm64.deb) |
-| RootHide | [uuhelper_1.0.2_arm64e.deb](https://github.com/5hux1n/uuhelper/releases/download/v1.0.2/uuhelper_1.0.2_arm64e.deb) |
+| Rootless | [uuhelper_1.0.3_arm64.deb](https://github.com/5hux1n/uuhelper/releases/download/v1.0.3/uuhelper_1.0.3_arm64.deb) |
+| RootHide | [uuhelper_1.0.3_arm64e.deb](https://github.com/5hux1n/uuhelper/releases/download/v1.0.3/uuhelper_1.0.3_arm64e.deb) |
 
 可通过个人插件源 [apt.mjh.im](https://apt.mjh.im/) 直接添加安装。
 
 ## 更新日志
+
+### 1.0.3
+- 适配 UU 远程 4.45.0，恢复快捷键、圆盘滚轮与视角记忆。
+- 移除客户端版本号限制。
 
 ### 1.0.2
 - 新增快捷切屏及功能独立开关，统一管理键盘、滚轮和画面增强。
