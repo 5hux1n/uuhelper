@@ -4,9 +4,9 @@
 <dict>
 	<key>Filter</key>
 	<dict>
-		<key>Bundles</key>
+		<key>Executables</key>
 		<array>
-			<string>com.netease.uuremote</string>
+			<string>nrd-ios-client</string>
 		</array>
 	</dict>
 </dict>

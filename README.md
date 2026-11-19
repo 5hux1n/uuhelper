@@ -6,7 +6,9 @@
 
 UU 远程 iOS 客户端增强插件，支持 iOS 15.0 及以上。按需启用常用组合快捷键、圆盘鼠标滚轮、快捷切屏和缩放位置记忆。
 
-当前版本：**1.0.3**。适配 UU 4.42.0（193）、4.43.0（195）和 4.45.0（197），不再按客户端版本号限制启用。
+当前版本：**1.0.4**。适配 UU 4.42.0（193）、4.43.0（195）、4.45.0（197）、4.48.0（202）和 4.48.1（203），不按客户端版本号限制启用。
+
+若 App 已通过 TrollFools 等工具注入 uuhelper，请先处理原注入再安装 DEB，避免同一插件被重复加载。
 
 ## 功能
 
@@ -20,20 +22,27 @@ UU 远程 iOS 客户端增强插件，支持 iOS 15.0 及以上。按需启用�
 
 安装后彻底退出并重新打开 UU，在「我的 → 设置 → uu 远控增强」打开总开关，再选择需要的功能。仅开启总开关不会自动打开其它功能。
 
-合并版包含原「UU远控切屏」的功能，以后只维护 uuhelper。安装包已声明与旧切屏包互斥，包管理器安装时会要求替换旧切屏插件；普通更新不会清除已保存的开关选择。
+合并版包含原「UU远控切屏」的功能，以后只维护 uuhelper。若仍安装旧切屏插件，请先在包管理器移除，避免同时接管工具栏；普通更新不会清除已保存的开关选择。
+
+## 本地构建
+
+运行 `scripts/build.sh`，在 `dist/` 生成 `uu远控增强_版本号_arm64.deb`（Rootless）和 `uu远控增强_版本号_arm64e.deb`（RootHide），版本号从实际 DEB 元数据读取。构建会检查包布局、架构、过滤器及 macOS 归档附属文件。公开发布时使用英文名 `uuhelper_版本号_架构.deb`，与本地包内容一致。
 
 ## 正式版下载
 
-正式版本：**1.0.3**。包名：`uuhelper`（RootHide 为 `uuhelper.roothide`）。
+正式版本：**1.0.4**。包名：`uuhelper`（RootHide 为 `uuhelper.roothide`）。
 
 | 环境 | 下载 |
 |---|---|
-| Rootless | [uuhelper_1.0.3_arm64.deb](https://github.com/5hux1n/uuhelper/releases/download/v1.0.3/uuhelper_1.0.3_arm64.deb) |
-| RootHide | [uuhelper_1.0.3_arm64e.deb](https://github.com/5hux1n/uuhelper/releases/download/v1.0.3/uuhelper_1.0.3_arm64e.deb) |
+| Rootless | [uuhelper_1.0.4_arm64.deb](https://github.com/5hux1n/uuhelper/releases/download/v1.0.4/uuhelper_1.0.4_arm64.deb) |
+| RootHide | [uuhelper_1.0.4_arm64e.deb](https://github.com/5hux1n/uuhelper/releases/download/v1.0.4/uuhelper_1.0.4_arm64e.deb) |
 
 可通过个人插件源 [apt.mjh.im](https://apt.mjh.im/) 直接添加安装。
 
 ## 更新日志
+
+### 1.0.4
+- 适配 UU 远程 4.48.1，恢复圆盘滚轮功能。
 
 ### 1.0.3
 - 适配 UU 远程 4.45.0，恢复快捷键、圆盘滚轮与视角记忆。

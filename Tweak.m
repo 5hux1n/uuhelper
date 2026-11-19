@@ -14,6 +14,8 @@ extern void uuss_call_key_sink(void *fn, void *sink, void *array, uint8_t action
 extern bool uu_send_key_array(const uint8_t *codes, intptr_t count, void *fn, void *sink, void *type,
                               void *wtable, void (*callback)(void *, void *, void *, uint8_t, void *, void *));
 extern void uuss_call_swift_geometry(void *fn, void *swiftSelf, double a, double b);
+extern bool uu_send_wheel_packet(void *fn, int64_t delta, void *context,
+                                 bool (*callback)(void *, void *, intptr_t));
 
 #define UULog(fmt, ...) NSLog(@"[uuhelper] " fmt, ##__VA_ARGS__)
 
@@ -1269,13 +1271,38 @@ static const double kWheelStep = 14.0 * M_PI / 180.0;
 static BOOL UUWheelFunctions(void **build, void **send) {
     *build = UUNativeEntry(UUWheelBuild);
     *send = UUNativeEntry(UUWheelTransport);
-    return *build && *send;
+    if (!*build) return NO;
+    Class manager = objc_getClass("StreamerManager");
+    return *send || (class_getClassMethod(manager, @selector(share)) &&
+                     class_getInstanceMethod(manager, @selector(sendControlData:size:toHandle:)));
 }
 
-static BOOL UUWheelSend(NSInteger dy) {
+typedef struct {
+    __unsafe_unretained id manager;
+    uint64_t handle;
+} UUWheelTransportContext;
+
+static bool UUWheelSendPacket(void *rawContext, void *packet, intptr_t count) {
+    UUWheelTransportContext *context = rawContext;
+    if (!packet || count <= 0) return false;
+    ((id (*)(id, SEL, id, uint64_t, uint64_t))(void *)objc_msgSend)(
+        context->manager, @selector(sendControlData:size:toHandle:), (__bridge id)packet, count, context->handle);
+    return true;
+}
+
+static BOOL UUWheelSend(UIView *view, NSInteger dy) {
     if (!UUFeatureEnabled(@"wheel")) return NO;
     void *buildFn = NULL, *sendFn = NULL;
     if (!UUWheelFunctions(&buildFn, &sendFn)) return NO;
+    if (!sendFn) {
+        id session = UUObjectIvar(UUFindViewModel(view), "session");
+        uint64_t handle = 0;
+        if (!UURawIvar(session, "connectionHandle", &handle, sizeof(handle)) || !handle) return NO;
+        id manager = ((id (*)(id, SEL))(void *)objc_msgSend)(objc_getClass("StreamerManager"), @selector(share));
+        if (![manager respondsToSelector:@selector(sendControlData:size:toHandle:)]) return NO;
+        UUWheelTransportContext context = { manager, handle };
+        return uu_send_wheel_packet(buildFn, dy, &context, UUWheelSendPacket);
+    }
     typedef struct { uint64_t a, b; } UUSwiftString;
     UUSwiftString (*build)(int64_t, int64_t, int64_t, uint8_t) = buildFn;
     void (*send)(void *, void *, uint64_t, uint64_t) = sendFn;
@@ -1433,7 +1460,7 @@ static void UUWheelHandle(UIView *view, SEL cmd, UIGestureRecognizer *gesture, I
         NSInteger sent = 0;
         while (fabs(state.accumulated) >= kWheelStep && sent < 4) {
             double sign = state.accumulated > 0 ? 1.0 : -1.0;
-            if (!UUWheelSend(sign > 0 ? -120 : 120)) break;
+            if (!UUWheelSend(view, sign > 0 ? -120 : 120)) break;
             state.accumulated -= sign * kWheelStep;
             sent++;
             [state.feedback selectionChanged];

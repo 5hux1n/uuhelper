@@ -21,7 +21,7 @@ make package THEOS=/Users/manjunhong/theos THEOS_PACKAGE_SCHEME=rootless \
     THEOS_PACKAGE_DIR="$BUILD_TMP/rootless"
 RL_DEB="$(find "$BUILD_TMP/rootless" -maxdepth 1 -name '*.deb' -print -quit)"
 VER="$(/opt/homebrew/bin/dpkg-deb -f "$RL_DEB" Version)"
-cp "$RL_DEB" "dist/uuhelper_${VER}_arm64.deb"
+cp "$RL_DEB" "dist/uu远控增强_${VER}_arm64.deb"
 
 # 2. RootHide (iphoneos-arm64e, native roothide)
 make clean THEOS=/Users/manjunhong/theos-roothide THEOS_PACKAGE_SCHEME=roothide >/dev/null
@@ -30,11 +30,12 @@ make package THEOS=/Users/manjunhong/theos-roothide THEOS_PACKAGE_SCHEME=roothid
     THEOS_PACKAGE_DIR="$BUILD_TMP/roothide"
 RH_DEB="$(find "$BUILD_TMP/roothide" -maxdepth 1 -name '*.deb' -print -quit)"
 VER_RH="$(/opt/homebrew/bin/dpkg-deb -f "$RH_DEB" Version)"
-cp "$RH_DEB" "dist/uuhelper_${VER_RH}_arm64e.deb"
+cp "$RH_DEB" "dist/uu远控增强_${VER_RH}_arm64e.deb"
+[ "$VER" = "$VER_RH" ]
 
 # 3. Verification checklist (package skill §5)
-python3 - "$ROOT/dist/uuhelper_${VER}_arm64.deb" "$ROOT/dist/uuhelper_${VER_RH}_arm64e.deb" <<'PY'
-import subprocess, sys, tempfile, pathlib
+python3 - "$ROOT/dist/uu远控增强_${VER}_arm64.deb" "$ROOT/dist/uu远控增强_${VER_RH}_arm64e.deb" <<'PY'
+import io, plistlib, subprocess, sys, tarfile, tempfile, pathlib
 
 rl_deb, rh_deb = [pathlib.Path(p) for p in sys.argv[1:3]]
 
@@ -47,10 +48,16 @@ def check_deb(deb, expect_pkg, expect_arch, expect_prefix, expect_rpath):
         assert fields['Name'].endswith(' (Roothide)'), fields
     assert fields['Author'] == 'junhong', fields
     assert fields['Maintainer'] == 'junhong', fields
-    assert fields['Depends'] == 'firmware (>= 15.0)', fields
-    assert set(fields['Conflicts'].split(', ')) == {'im.mjh.uuscreenswitch', 'im.mjh.uuscreenswitch.roothide'}, fields
-    assert fields['Replaces'] == fields['Conflicts'], fields
+    assert not {'Depends', 'Conflicts', 'Replaces'} & fields.keys(), fields
     assert fields['Version'] in deb.name, fields
+    for flag in ['--ctrl-tarfile', '--fsys-tarfile']:
+        archive = subprocess.check_output(['/opt/homebrew/bin/dpkg-deb', flag, str(deb)])
+        with tarfile.open(fileobj=io.BytesIO(archive)) as contents:
+            for member in contents:
+                assert not any(p.startswith('._') or p in ('.DS_Store', '__MACOSX')
+                               for p in pathlib.PurePosixPath(member.name).parts), member.name
+                assert not any(k.startswith(('LIBARCHIVE.', 'SCHILY.xattr.')) or 'com.apple.' in k
+                               for k in member.pax_headers), member.pax_headers
 
     with tempfile.TemporaryDirectory() as td:
         subprocess.check_call(['/opt/homebrew/bin/dpkg-deb', '-x', str(deb), td])
@@ -63,9 +70,12 @@ def check_deb(deb, expect_pkg, expect_arch, expect_prefix, expect_rpath):
         if expect_rpath:
             otool_l = subprocess.check_output(['otool', '-l', str(dylib)], text=True)
             assert otool_l.count('cmd LC_RPATH') >= 2, "Missing LC_RPATH in roothide dylib"
-        assert b'com.netease.uuremote' in plist.read_bytes()
+        assert plistlib.loads(plist.read_bytes()) == {'Filter': {'Executables': ['nrd-ios-client']}}
+        undefined = subprocess.check_output(['nm', '-u', str(dylib)], text=True)
+        for symbol in ['_uu_send_wheel_packet', '_uuss_build_wheel_packet']:
+            assert symbol not in undefined, f"Unresolved helper {symbol}"
         data = dylib.read_bytes()
-        for s in ['_TtC14nrd_ios_client24CombineKeyViewController', '_TtC14nrd_ios_client9MouseView', 'Shift+Enter', '_TtC14nrd_ios_client13RemoteToolBar', '_TtC14nrd_ios_client25MineSettingTableViewModel', '_TtC14nrd_ios_client22MineSettingsSwitchCell', 'im.mjh.uuhelper', 'displaySwitch', 'viewportMemory']:
+        for s in ['_TtC14nrd_ios_client24CombineKeyViewController', '_TtC14nrd_ios_client9MouseView', 'Shift+Enter', '_TtC14nrd_ios_client13RemoteToolBar', '_TtC14nrd_ios_client25MineSettingTableViewModel', '_TtC14nrd_ios_client22MineSettingsSwitchCell', 'im.mjh.uuhelper', 'displaySwitch', 'viewportMemory', 'connectionHandle', 'sendControlData:size:toHandle:']:
             assert s.encode('utf-8') in data or s.encode('utf-16-le') in data, f"Missing string {s}"
     print(f"[OK] {deb.name}: Package={fields['Package']} Arch={fields['Architecture']} Version={fields['Version']}")
 

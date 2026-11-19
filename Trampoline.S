@@ -53,3 +53,14 @@ _uuss_call_swift_geometry:
     ldp     x20, x21, [sp, #16]
     ldp     x29, x30, [sp], #32
     ret
+
+// Raw fn=x0, delta=x1 -> native event builder(0, delta, 0, 7), returning String?.
+// The scanned code address has no Swift function-pointer authentication signature.
+    .align 2
+    .globl _uuss_build_wheel_packet
+_uuss_build_wheel_packet:
+    mov     x16, x0
+    mov     x0, #0
+    mov     x2, #0
+    mov     w3, #7
+    br      x16
